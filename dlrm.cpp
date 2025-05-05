@@ -195,19 +195,12 @@ public:
         const std::vector<int64_t>& device_ids,
         int64_t dim = 0) {
         
-        std::vector<torch::Tensor> outputs;
-        int64_t chunk_size = tensor.size(dim) / device_ids.size();
-        int64_t remainder = tensor.size(dim) % device_ids.size();
         
-        int64_t start = 0;
+        auto outputs_t = torch::chunk(tensor, device_ids.size(), dim);
+        std::vector<torch::Tensor> outputs(outputs_t.begin(), outputs_t.end());
         for (size_t i = 0; i < device_ids.size(); i++) {
-            int64_t end = start + chunk_size + (i < remainder ? 1 : 0);
             torch::Device device(torch::kCUDA, device_ids[i]);
-            
-            torch::Tensor slice = tensor.slice(dim, start, end).to(device);
-            outputs.push_back(slice);
-            
-            start = end;
+            outputs[i] = outputs[i].to(device);
         }
         
         return outputs;
@@ -243,8 +236,11 @@ public:
             
             // 确保数据在相同的设备上
             auto device = emb_l[k]->parameters()[0].device();
+            std::cout<<"K device: "<<device<<std::endl;
             sparse_index_group_batch = sparse_index_group_batch.to(device);
             sparse_offset_group_batch = sparse_offset_group_batch.to(device);
+            std::cout<<"sparse index shape: "<<sparse_index_group_batch.sizes()<<std::endl;
+            std::cout<<"sparse offset shape: "<<sparse_offset_group_batch.sizes()<<std::endl;
             
             torch::Tensor per_sample_weights;
             if (v_W_l[k].defined()) {
@@ -255,40 +251,15 @@ public:
             auto E = emb_l[k];
             auto emb_bag = std::dynamic_pointer_cast<torch::nn::EmbeddingBagImpl>(E);
             
-            if (!emb_bag) {
-                // 如果不是EmbeddingBag类型，可能是普通Embedding
-                auto emb = std::dynamic_pointer_cast<torch::nn::EmbeddingImpl>(E);
-                if (!emb) {
-                    throw std::runtime_error("错误: 嵌入层类型不支持");
-                }
-                
-                torch::nn::functional::EmbeddingBagFuncOptions options = 
-                    torch::nn::functional::EmbeddingBagFuncOptions()
-                        .offsets(sparse_offset_group_batch)
-                        .mode(torch::kSum)
-                        .scale_grad_by_freq(false)
-                        .sparse(true);
-                        
-                if (per_sample_weights.defined()) {
-                    options.per_sample_weights(per_sample_weights);
-                }
-                
-                torch::Tensor V = torch::nn::functional::embedding_bag(
-                    sparse_index_group_batch,
-                    emb->weight,
-                    options);
-                    
-                ly.push_back(V);
+            // 直接使用EmbeddingBag的forward函数
+            torch::Tensor V;
+            if (per_sample_weights.defined()) {
+                V = emb_bag->forward(sparse_index_group_batch, sparse_offset_group_batch, per_sample_weights);
             } else {
-                // 直接使用EmbeddingBag的forward函数
-                torch::Tensor V;
-                if (per_sample_weights.defined()) {
-                    V = emb_bag->forward(sparse_index_group_batch, sparse_offset_group_batch, per_sample_weights);
-                } else {
-                    V = emb_bag->forward(sparse_index_group_batch, sparse_offset_group_batch);
-                }
-                ly.push_back(V);
+                V = emb_bag->forward(sparse_index_group_batch, sparse_offset_group_batch);
             }
+            std::cout<<"embedding output shape: "<<V.sizes()<<std::endl;
+            ly.push_back(V);
         }
         
         return ly;
@@ -367,18 +338,23 @@ public:
             throw std::runtime_error("ERROR: corrupted model input detected in parallel_forward call");
         }
         
-        std::vector<torch::Tensor> t_list, i_list;
-        for (size_t k = 0; k < emb_l->size(); k++) {
-            torch::Device d(torch::kCUDA, k % ndevices);
-            t_list.push_back(lS_o[k].to(d));
-            i_list.push_back(lS_i[k].to(d));
-        }
-        lS_o = torch::stack(t_list);
-        lS_i = i_list;
+        // std::vector<torch::Tensor> t_list, i_list;
+        // for (size_t k = 0; k < emb_l->size(); k++) {
+        //     torch::Device d(torch::kCUDA, k % ndevices);
+        //     t_list.push_back(lS_o[k].to(d));
+        //     i_list.push_back(lS_i[k].to(d));
+        // }
+        // lS_o = torch::stack(t_list);
+        // lS_i = i_list;
         
         // 并行计算
         // 底层MLP (数据并行)
         std::vector<torch::Tensor> x = parallel_apply_modules(bot_l_replicas, dense_x_list);
+        std::cout<<"x shape: [";
+        for(auto& x_t : x){
+            std::cout<<x_t.sizes()<<", ";
+        }
+        std::cout<<"]"<<std::endl;
         
         // 嵌入层
         std::vector<torch::Tensor> ly = apply_emb(lS_o, lS_i, emb_l, v_W_l);
@@ -393,7 +369,13 @@ public:
             torch::Device d(torch::kCUDA, k % ndevices);
             std::vector<torch::Tensor> scattered = scatter_tensors(ly[k], device_ids);
             t_list_2d.push_back(scattered);
+            std::cout<<"scattered shape: [";
+            for(auto& x_t : scattered){
+                std::cout<<x_t.sizes()<<", ";
+            }
+            std::cout<<"]"<<std::endl;
         }
+        
         
         // 调整列表顺序按设备
         std::vector<std::vector<torch::Tensor>> ly_per_device(ndevices);
@@ -407,6 +389,8 @@ public:
         // 特征交互
         std::vector<torch::Tensor> z;
         for (int64_t k = 0; k < ndevices; k++) {
+            std::cout<<"x["<<k<<"] shape: "<<x[k].sizes()<<";"<<" x device: " <<x[k].device()<<";";
+            std::cout<<"ly_per_device["<<k<<"] shape: "<<ly_per_device[k][0].sizes()<<"; ly_per_device device: " <<ly_per_device[k][0].device()<<std::endl;
             z.push_back(interact_features(x[k], ly_per_device[k]));
         }
         
@@ -494,6 +478,7 @@ public:
             // 创建操作符 - 无论ndevices如何都初始化嵌入层
             std::vector<torch::Tensor> w_list;
             std::tie(this->emb_l, w_list) = this->create_emb(m_spa, ln_emb, weighted_pooling);
+            std::cout<<"emb_l shape: "<<this->emb_l<<std::endl;
             
             if (this->weighted_pooling == "learned") {
                 for (auto& w : w_list) {
@@ -523,12 +508,12 @@ TORCH_MODULE(DLRM);
 int main() {
     // 模型参数
     std::vector<int64_t> ln_emb = {10, 3, 2, 1};  // 嵌入表大小
-    std::vector<int64_t> ln_bot = {4, 3, 2};  // 底层MLP结构
+    std::vector<int64_t> ln_bot = {4, 3, 5};  // 底层MLP结构
     int64_t num_fea = ln_emb.size() + 1;
     int64_t m_den_out = ln_bot[ln_bot.size() - 1]; 
     int64_t num_int = (num_fea * (num_fea - 1)) / 2 + m_den_out;
     std::vector<int64_t> ln_top = {num_int, 4, 2, 1};
-    int64_t mini_batch_size = 11;            // 批次大小
+    int64_t mini_batch_size = 12;            // 样本数量
     int64_t num_indices_per_lookup = 2;      // 每个样本每个特征的索引数量
     bool fixed_indices = false;              // 是否使用固定数量的索引
     std::string arch_interaction_op = "dot";
@@ -537,7 +522,7 @@ int main() {
     int64_t sigmoid_top = ln_top.size() - 2;
     bool sync_dense_params = true;
     float loss_threshold = 0.0;
-    int64_t ngpus = 1;
+    int64_t ngpus = 2;
     int64_t ndevices = std::min({ngpus, mini_batch_size, num_fea - 1});
     bool qr_flag = false;
     std::string qr_operation = "mult";
