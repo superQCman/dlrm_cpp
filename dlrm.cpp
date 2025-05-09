@@ -366,7 +366,7 @@ public:
         
         std::vector<std::vector<torch::Tensor>> t_list_2d;
         for (size_t k = 0; k < emb_l->size(); k++) {
-            torch::Device d(torch::kCUDA, k % ndevices);
+            // torch::Device d(torch::kCUDA, k % ndevices);
             std::vector<torch::Tensor> scattered = scatter_tensors(ly[k], device_ids);
             t_list_2d.push_back(scattered);
             std::cout<<"scattered shape: [";
@@ -411,10 +411,22 @@ public:
         return z0;
     }
 
+    torch::Tensor sequential_forward(
+        torch::Tensor dense_x,
+        torch::Tensor lS_o,
+        std::vector<torch::Tensor> lS_i){
+            torch::Tensor x = this->bot_l->forward(dense_x);
+            std::vector<torch::Tensor> ly = apply_emb(lS_o, lS_i, this->emb_l, this->v_W_l);
+            torch::Tensor z = interact_features(x, ly);
+            torch::Tensor p = this->top_l->forward(z);
+            return p;
+        }
+
     torch::Tensor forward(torch::Tensor dense_x,
         torch::Tensor lS_o,
         std::vector<torch::Tensor> lS_i){
-            return parallel_forward(dense_x, lS_o, lS_i);
+           if(this->ndevices > 0 ) return parallel_forward(dense_x, lS_o, lS_i);
+           else return sequential_forward(dense_x, lS_o,lS_i);
         }
     
     // 构造函数
@@ -522,7 +534,7 @@ int main() {
     int64_t sigmoid_top = ln_top.size() - 2;
     bool sync_dense_params = true;
     float loss_threshold = 0.0;
-    int64_t ngpus = 2;
+    int64_t ngpus = 0;
     int64_t ndevices = std::min({ngpus, mini_batch_size, num_fea - 1});
     bool qr_flag = false;
     std::string qr_operation = "mult";
@@ -542,7 +554,7 @@ int main() {
     torch::Tensor dense_x = torch::rand({mini_batch_size, ln_bot[0]}, torch::kFloat32);
     
     // 可选：移动到GPU（如果可用）
-    if (torch::cuda::is_available()) {
+    if (torch::cuda::is_available() && ndevices) {
         dense_x = dense_x.to(torch::kCUDA);
         std::cout << "Using CUDA" << std::endl;
     }
